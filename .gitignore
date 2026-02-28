@@ -1,0 +1,29 @@
+# secrets
+.env
+*.key
+
+# caches / temp
+hf_cache/
+tmp/
+__pycache__/
+*.pyc
+
+# audio
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.aac
+*.ogg
+
+# outputs (議事録はコミットしない)
+*.srt
+*.vtt
+*.txt
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
