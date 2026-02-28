@@ -131,7 +131,7 @@ Outputs will be written to:
 
 ---
 
-# 日本語での使用法
+# 使用法
 
 Windows 11 + Docker Desktop（WSL2）+ NVIDIA GPU 環境で、**pyannote による話者分離**と **Kotoba Whisper による文字起こし**を連携して実行するためのリポジトリである。
 
