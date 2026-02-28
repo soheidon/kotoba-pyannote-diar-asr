@@ -1,9 +1,4 @@
-# kotoba-pyannote-diar-asr / Kotoba Whisper と pyannote を連携して話者分離＋文字起こしをする(Windows+Docker+NVIDIA GPU)
-End-to-end pipeline for speaker diarization (pyannote) and Japanese transcription (Kotoba Whisper) using Docker on Windows 11 (WSL2) with NVIDIA GPU; outputs TXT/SRT with speaker labels.
-Windows 11（WSL2）+ Docker + NVIDIA GPUで、pyannote話者分離→Kotoba Whisper文字起こしを一括実行し、話者ラベル付きTXT/SRTを生成する。 
-
 # kotoba-pyannote-diar-asr
-
 Dockerized speaker diarization + Japanese ASR pipeline (**pyannote + Kotoba Whisper**) for **Windows 11 (WSL2) + NVIDIA GPU**.
 
 This repository runs an end-to-end workflow:
@@ -136,7 +131,7 @@ Outputs will be written to:
 
 ---
 
-# 日本語（後半）
+# 日本語での使用法
 
 Windows 11 + Docker Desktop（WSL2）+ NVIDIA GPU 環境で、**pyannote による話者分離**と **Kotoba Whisper による文字起こし**を連携して実行するためのリポジトリである。
 
@@ -268,5 +263,5 @@ docker run --rm --gpus all `
 * 環境によってモデルロードが失敗するケースがあるため、互換性目的で `torch.load(..., weights_only=False)` を強制するパッチを入れている。
 * 音声や議事録は個人情報・機密情報が混ざりやすいので、リポジトリ外で管理するのが安全である。
 
-```
+
 
