@@ -6,9 +6,9 @@
 #  - エラー時の Traceback 取得と VRAM 使用量のロギングを追加
 #  - 出力を VTT および TXT 形式に変更
 #  - 話者分離終了後の GPU メモリ解放
-#  - 辞書ありモード（TSV形式・2層構造 + トークンバジェット）
-#    Layer A: pre_asr_hint = prompt_ids（token budget で greedy トリミング、失敗時は自動 fallback）
-#    Layer B: post_asr_correction = ASR 後に読み→正式表記を置換補正（常に有効・全件使用）
+#  - 辞書ありモード（オプション・デフォルトオフ）
+#    USE_LAYER_A=1 で Layer A（pre_asr_hint）、USE_LAYER_B=1 で Layer B（post_asr_correction）
+#    通常運用は両方オフで安定。必要時のみ有効化して比較・実験可能
 # ================================
 
 import gc
@@ -321,7 +321,12 @@ LANG_KW = {"language": LANG, "task": TASK}
 # 辞書: 未指定なら辞書なしモード
 DICT_PATH_ENV = os.getenv("DICT_PATH", "").strip()
 DICT_PATH = Path(DICT_PATH_ENV) if DICT_PATH_ENV else None
-# Layer A: 推論前ヒントのトークンバジェット（Whisper max_target_positions=448 を考慮して余裕を持たせる）
+# 辞書機能はオプション。デフォルトは両方オフ（辞書なし相当で安定運用）
+USE_LAYER_A = os.getenv("USE_LAYER_A", "0").strip() in ("1", "true", "yes", "on")
+USE_LAYER_B = os.getenv("USE_LAYER_B", "0").strip() in ("1", "true", "yes", "on")
+LAYER_A_FALLBACK = os.getenv("LAYER_A_FALLBACK", "1").strip() in ("1", "true", "yes", "on")
+DEBUG_GLOSSARY_LOG = os.getenv("DEBUG_GLOSSARY_LOG", "0").strip() in ("1", "true", "yes", "on")
+# Layer A 用トークンバジェット（USE_LAYER_A=1 のときのみ使用）
 GLOSSARY_TOKEN_BUDGET = int(os.getenv("GLOSSARY_TOKEN_BUDGET", "100"))
 
 device = 0 if torch.cuda.is_available() else -1
@@ -332,7 +337,8 @@ log(f"[CFG] WORK_SOURCE={WORK_SOURCE}")
 log(f"[CFG] WORK_OUTPUT={WORK_OUTPUT}")
 log(f"[CFG] INPUT_FILENAME='{INPUT_FILENAME}'")
 log(f"[CFG] NUM_SPEAKERS_ENV='{NUM_SPEAKERS_ENV}' -> NUM_SPEAKERS={NUM_SPEAKERS}")
-log(f"[CFG] DICT_PATH={DICT_PATH if DICT_PATH else '(未指定・辞書なし)'}")
+log(f"[CFG] DICT_PATH={DICT_PATH if DICT_PATH else '(未指定)'}")
+log(f"[CFG] USE_LAYER_A={USE_LAYER_A} USE_LAYER_B={USE_LAYER_B} LAYER_A_FALLBACK={LAYER_A_FALLBACK} DEBUG_GLOSSARY_LOG={DEBUG_GLOSSARY_LOG}")
 log(f"[CFG] GLOSSARY_TOKEN_BUDGET={GLOSSARY_TOKEN_BUDGET}")
 
 if not INPUT_FILE.exists():
@@ -425,7 +431,7 @@ if dia is not None:
 _release_gpu_memory(device, log)
 
 # ================================
-# 辞書読み込み（辞書ありモード）
+# 辞書読み込み（オプション: USE_LAYER_A / USE_LAYER_B で有効化）
 # ================================
 base = INPUT_FILE.stem
 dict_log_file = None
@@ -435,21 +441,31 @@ glossary_entries: list[tuple[str, str]] | None = None
 if DICT_PATH:
     glossary_entries = load_glossary_tsv(DICT_PATH, log)
 
-if glossary_entries:
-    log(f"[DICT][Layer B] post_asr_correction を有効化しました（全{len(glossary_entries)}件使用）")
-    dict_log_path = WORK_OUTPUT / f"{base}.dict.log"
-    try:
-        dict_log_file = open(dict_log_path, "w", encoding="utf-8")
-        def _write_dict_log(msg: str) -> None:
-            dict_log_file.write(msg + "\n")
-            dict_log_file.flush()
-        dict_log_fn = _write_dict_log
-        dict_log_fn(f"# {base}.dict.log - 辞書補正・事前ヒントの記録")
-        dict_log_fn(f"# 辞書総件数: {len(glossary_entries)}")
-    except OSError as e:
-        log(f"[WARN] dict.log を開けません: {dict_log_path} ({e})")
+if not glossary_entries:
+    if DICT_PATH:
+        log("[DICT] 辞書ファイル未読み込みまたは空。辞書機能は使いません。")
+    else:
+        log("[DICT] DICT_PATH 未指定。辞書機能は無効です。")
+elif not (USE_LAYER_A or USE_LAYER_B):
+    log(f"[DICT] 辞書読み込み済み（{len(glossary_entries)}件）。USE_LAYER_A=0, USE_LAYER_B=0 のため辞書機能はオフです。")
 else:
-    log("[DICT] 辞書なしモードで実行します")
+    if USE_LAYER_A:
+        log(f"[DICT][Layer A] pre_asr_hint を有効化（token_budget={GLOSSARY_TOKEN_BUDGET}）")
+    if USE_LAYER_B:
+        log(f"[DICT][Layer B] post_asr_correction を有効化（全{len(glossary_entries)}件）")
+    if DEBUG_GLOSSARY_LOG:
+        dict_log_path = WORK_OUTPUT / f"{base}.dict.log"
+        try:
+            dict_log_file = open(dict_log_path, "w", encoding="utf-8")
+            def _write_dict_log(msg: str) -> None:
+                dict_log_file.write(msg + "\n")
+                dict_log_file.flush()
+            dict_log_fn = _write_dict_log
+            dict_log_fn(f"# {base}.dict.log - 辞書補正・事前ヒントの記録")
+            dict_log_fn(f"# USE_LAYER_A={USE_LAYER_A} USE_LAYER_B={USE_LAYER_B}")
+            dict_log_fn(f"# 辞書総件数: {len(glossary_entries)}")
+        except OSError as e:
+            log(f"[WARN] dict.log を開けません: {dict_log_path} ({e})")
 
 # ================================
 # ASR pipeline
@@ -469,18 +485,17 @@ except Exception as e:
     raise
 
 # ================================
-# 辞書 Layer A: pre_asr_hint
-# pipeline ロード後に prompt_ids を生成（tokenizer が使える状態になってから）
+# 辞書 Layer A: pre_asr_hint（USE_LAYER_A=1 のときのみ）
 # ================================
 pre_asr_prompt_ids = None
-if glossary_entries:
+if glossary_entries and USE_LAYER_A:
     pre_asr_prompt_ids = build_prompt_ids_with_budget(
         glossary_entries, asr, GLOSSARY_TOKEN_BUDGET, log, dict_log_fn=dict_log_fn
     )
     if pre_asr_prompt_ids is not None:
-        log("[DICT][Layer A] pre_asr_hint 有効: prompt_ids を generate_kwargs に渡します")
+        log("[DICT][Layer A] prompt_ids を generate_kwargs に渡します")
     else:
-        log("[DICT][Layer A] pre_asr_hint 無効: post_asr_correction のみで継続します")
+        log("[DICT][Layer A] prompt_ids 生成失敗。Layer A なしで継続します")
 
 log("[STEP] セグメントごとにASR中...")
 
@@ -515,7 +530,11 @@ try:
                     "model_kwargs",
                 ]
             )
-            if pre_asr_prompt_ids is not None and is_prompt_error:
+            if (
+                pre_asr_prompt_ids is not None
+                and is_prompt_error
+                and LAYER_A_FALLBACK
+            ):
                 log(
                     f"\n[WARN] ASR推論でプロンプト長起因と思われるエラー発生。"
                     f"Layer Aを無効化して再試行します。"
@@ -535,7 +554,7 @@ try:
             else:
                 raise e_asr
         text = (out.get("text") or "").strip()
-        if glossary_entries:
+        if glossary_entries and USE_LAYER_B:
             text = apply_glossary_correction(
                 text,
                 glossary_entries,
@@ -578,9 +597,9 @@ with (WORK_OUTPUT / f"{base}.txt").open("w", encoding="utf-8") as f:
 if dict_log_file is not None:
     try:
         dict_log_file.close()
+        log(f"[DICT] 辞書ログ: {WORK_OUTPUT / f'{base}.dict.log'}")
     except Exception:
         pass
-    log(f"[DICT] 辞書ログ: {WORK_OUTPUT / f'{base}.dict.log'}")
 
 shutil.rmtree(tmp_seg_dir, ignore_errors=True)
 shutil.rmtree(tmp_in_dir, ignore_errors=True)
