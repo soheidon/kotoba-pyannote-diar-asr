@@ -122,6 +122,7 @@ def build_prompt_ids_with_budget(
     asr_pipeline,
     token_budget: int,
     log_fn,
+    dict_log_fn=None,
 ):
     """
     【Layer A: pre_asr_hint】
@@ -140,7 +141,10 @@ def build_prompt_ids_with_budget(
         ):
             prompt_helper = asr_pipeline.tokenizer
         else:
-            log_fn("[DICT][Layer A] processor/tokenizer に get_prompt_ids が見つかりません。")
+            reason = "processor/tokenizer に get_prompt_ids が見つからない"
+            log_fn(f"[DICT][Layer A] {reason}。pre_asr_hint を無効化します。")
+            if dict_log_fn is not None:
+                dict_log_fn(f"[DICT][Layer A] enabled=false reason={reason}")
             return None
 
         target_device = asr_pipeline.model.device
@@ -167,10 +171,12 @@ def build_prompt_ids_with_budget(
             selected_formals.append(formal)
 
         if not selected_formals:
-            log_fn(
-                f"[DICT][Layer A] 1件目からバジェット({token_budget}token)超過。"
-                "pre_asr_hint を無効化します。"
-            )
+            reason = f"1件目からバジェット({token_budget}token)超過"
+            log_fn(f"[DICT][Layer A] {reason}。pre_asr_hint を無効化します。")
+            if dict_log_fn is not None:
+                dict_log_fn(f"[DICT][Layer A] glossary_total={len(entries)}")
+                dict_log_fn(f"[DICT][Layer A] token_budget={token_budget}")
+                dict_log_fn(f"[DICT][Layer A] enabled=false reason={reason}")
             return None
 
         prompt_text = " ".join(selected_formals)
@@ -188,41 +194,62 @@ def build_prompt_ids_with_budget(
                     if hasattr(ids, "to")
                     else torch.tensor([ids], dtype=torch.long).to(target_device)
                 )
+        # コンソールには要約のみ
         log_fn(
             f"[DICT][Layer A] prompt_ids 生成成功: "
-            f"{len(selected_formals)}件/{len(entries)}件を採用, "
-            f"shape={list(prompt_ids.shape)}, device={target_device}"
+            f"{len(selected_formals)}件/{len(entries)}件を採用"
         )
-        preview = prompt_text[:120] + ("..." if len(prompt_text) > 120 else "")
-        log_fn(f"[DICT][Layer A] prompt 内容: {preview}")
+        # 詳細は .dict.log へ
+        if dict_log_fn is not None:
+            dict_log_fn(f"[DICT][Layer A] glossary_total={len(entries)}")
+            dict_log_fn(f"[DICT][Layer A] token_budget={token_budget}")
+            dict_log_fn(f"[DICT][Layer A] selected_count={len(selected_formals)}")
+            dict_log_fn(
+                f"[DICT][Layer A] selected_formals={','.join(selected_formals)}"
+            )
+            dict_log_fn(f"[DICT][Layer A] prompt_ids_shape={list(prompt_ids.shape)}")
+            dict_log_fn("[DICT][Layer A] enabled=true")
         return prompt_ids
 
     except Exception:
-        log_fn(
-            f"[DICT][Layer A] prompt_ids 生成失敗:\n{traceback.format_exc()}"
-        )
-        log_fn("[DICT][Layer A] pre_asr_hint を無効化し、post_asr_correction のみで継続します")
+        reason = "prompt_ids 生成例外"
+        log_fn(f"[DICT][Layer A] {reason}。post_asr_correction のみで継続します。")
+        if dict_log_fn is not None:
+            dict_log_fn(f"[DICT][Layer A] enabled=false reason={reason}")
+            dict_log_fn(traceback.format_exc())
         return None
 
 
-def apply_glossary_correction(text: str, entries: list[tuple[str, str]], log_fn) -> str:
+def apply_glossary_correction(
+    text: str,
+    entries: list[tuple[str, str]],
+    log_fn,
+    *,
+    seg_idx: int | None = None,
+    speaker: str | None = None,
+    dict_log_fn=None,
+) -> str:
     """【Layer B: post_asr_correction】
     ASR 出力に対して読み→正式表記の補正を行う。
     長い読みを先に置換して、短い読みが長い読みに含まれる場合の誤置換を防ぐ。
     辞書あり時は常に有効。
+    dict_log_fn がある場合は各置換を .dict.log に記録する。
     """
     if not text or not entries:
         return text
     result = text
-    # 読みの長い順でソート（うたづちょう → うたづ の順）
     sorted_entries = sorted(entries, key=lambda x: len(x[1]), reverse=True)
-    replaced = 0
+    replacements: list[tuple[str, str]] = []
     for formal, reading in sorted_entries:
         if reading in result:
             result = result.replace(reading, formal)
-            replaced += 1
-    if replaced > 0:
-        log_fn(f"[DICT][Layer B] 補正実行: {replaced} 箇所置換")
+            replacements.append((reading, formal))
+    if replacements and dict_log_fn is not None and seg_idx is not None and speaker:
+        for reading, formal in replacements:
+            dict_log_fn(
+                f"[DICT][Layer B] seg={seg_idx} speaker={speaker} "
+                f"reading='{reading}' formal='{formal}'"
+            )
     return result
 
 
@@ -400,12 +427,27 @@ _release_gpu_memory(device, log)
 # ================================
 # 辞書読み込み（辞書ありモード）
 # ================================
+base = INPUT_FILE.stem
+dict_log_file = None
+dict_log_fn = None
+
 glossary_entries: list[tuple[str, str]] | None = None
 if DICT_PATH:
     glossary_entries = load_glossary_tsv(DICT_PATH, log)
 
 if glossary_entries:
     log(f"[DICT][Layer B] post_asr_correction を有効化しました（全{len(glossary_entries)}件使用）")
+    dict_log_path = WORK_OUTPUT / f"{base}.dict.log"
+    try:
+        dict_log_file = open(dict_log_path, "w", encoding="utf-8")
+        def _write_dict_log(msg: str) -> None:
+            dict_log_file.write(msg + "\n")
+            dict_log_file.flush()
+        dict_log_fn = _write_dict_log
+        dict_log_fn(f"# {base}.dict.log - 辞書補正・事前ヒントの記録")
+        dict_log_fn(f"# 辞書総件数: {len(glossary_entries)}")
+    except OSError as e:
+        log(f"[WARN] dict.log を開けません: {dict_log_path} ({e})")
 else:
     log("[DICT] 辞書なしモードで実行します")
 
@@ -433,7 +475,7 @@ except Exception as e:
 pre_asr_prompt_ids = None
 if glossary_entries:
     pre_asr_prompt_ids = build_prompt_ids_with_budget(
-        glossary_entries, asr, GLOSSARY_TOKEN_BUDGET, log
+        glossary_entries, asr, GLOSSARY_TOKEN_BUDGET, log, dict_log_fn=dict_log_fn
     )
     if pre_asr_prompt_ids is not None:
         log("[DICT][Layer A] pre_asr_hint 有効: prompt_ids を generate_kwargs に渡します")
@@ -475,8 +517,14 @@ try:
             )
             if pre_asr_prompt_ids is not None and is_prompt_error:
                 log(
-                    f"\n[WARN] ASR推論でプロンプト長起因と思われるエラー発生。Layer Aを無効化して再試行します。\n詳細: {e_asr}"
+                    f"\n[WARN] ASR推論でプロンプト長起因と思われるエラー発生。"
+                    f"Layer Aを無効化して再試行します。"
                 )
+                if dict_log_fn is not None:
+                    dict_log_fn(
+                        f"[DICT][Layer A] fallback_at_segment={idx} "
+                        f"reason={error_msg[:200]}"
+                    )
                 pre_asr_prompt_ids = None  # type: ignore
                 gen_kw_retry = dict(LANG_KW)
                 out = asr(
@@ -488,7 +536,14 @@ try:
                 raise e_asr
         text = (out.get("text") or "").strip()
         if glossary_entries:
-            text = apply_glossary_correction(text, glossary_entries, log)
+            text = apply_glossary_correction(
+                text,
+                glossary_entries,
+                log,
+                seg_idx=idx,
+                speaker=spk,
+                dict_log_fn=dict_log_fn,
+            )
         results.append({"speaker": spk, "start": st, "end": ed, "text": text})
 except Exception as e:
     log(f"[FATAL ERROR] ASR推論中に例外発生:\n{traceback.format_exc()}")
@@ -497,7 +552,6 @@ except Exception as e:
 # ================================
 # Write outputs
 # ================================
-base = INPUT_FILE.stem
 
 def fmt_vtt(t):
     td = datetime.timedelta(seconds=float(t))
@@ -521,6 +575,13 @@ with (WORK_OUTPUT / f"{base}.txt").open("w", encoding="utf-8") as f:
 # ================================
 # Cleanup
 # ================================
+if dict_log_file is not None:
+    try:
+        dict_log_file.close()
+    except Exception:
+        pass
+    log(f"[DICT] 辞書ログ: {WORK_OUTPUT / f'{base}.dict.log'}")
+
 shutil.rmtree(tmp_seg_dir, ignore_errors=True)
 shutil.rmtree(tmp_in_dir, ignore_errors=True)
 

@@ -143,6 +143,8 @@ When set, the pipeline:
 1. Uses the glossary as a `prompt_ids` hint for Whisper (greedy selection within token budget)
 2. Applies post-inference correction (reading → formal) on ASR output
 
+A `*.dict.log` file is written to the output folder (e.g. `2026-03-06-MIYAGAWA.dict.log`) with detailed records of Layer A (adopted terms, token budget) and Layer B (each replacement: seg, speaker, reading, formal). Use it to verify dictionary behavior.
+
 GPU memory is released after diarization, before ASR loading, to reduce peak VRAM usage.
 
 ## Notes
@@ -295,8 +297,10 @@ docker run --rm --gpus all `
 ## 辞書ありモード（任意）
 
 `DICT_PATH` に TSV ファイル（正式表記<TAB>よみ、例：`宇多津\tうたづ`）のパスを指定すると：
-1. 辞書を Whisper の `initial_prompt` ヒントとして使用（先頭 N 件）
+1. 辞書を Whisper の `prompt_ids` ヒントとして使用（トークンバジェット内で greedy 採用）
 2. ASR 出力に対して推論後補正（読み→正式表記）を適用
+
+出力フォルダに `*.dict.log`（例：`2026-03-06-MIYAGAWA.dict.log`）が出力され、Layer A の採用語・Layer B の各置換が記録される。
 
 話者分離終了後、ASR 開始前に GPU メモリを解放し、ピーク VRAM 使用量を抑えている。
 
