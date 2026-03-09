@@ -352,14 +352,17 @@ try:
 except Exception as e:
     log(f"[FATAL ERROR] 話者分離の実行中に例外発生:\n{traceback.format_exc()}")
     try:
+        if dia is not None:
+            dia = None
         _release_diarization_resources(dia, device, log)
     except Exception:
         pass
     raise
 
 # 話者分離終了後、ASR 開始前に GPU メモリを解放
+if dia is not None:
+    dia = None
 _release_diarization_resources(dia, device, log)
-dia = None
 
 # ================================
 # 辞書読み込み（辞書ありモード）
@@ -430,14 +433,30 @@ try:
             gen_kw["prompt_ids"] = pre_asr_prompt_ids
         try:
             out = asr(str(seg_path), return_timestamps=True, generate_kwargs=gen_kw)
-        except ValueError as e:
-            if "not used by the model" in str(e) and pre_asr_prompt_ids is not None:
-                log("[DICT][Layer A] prompt_ids/initial_prompt がモデルに未対応のため無効化し、再試行します")
+        except Exception as e_asr:
+            error_msg = str(e_asr)
+            is_prompt_error = any(
+                kw in error_msg
+                for kw in [
+                    "prompt_ids",
+                    "max_target_positions",
+                    "decoder_input_ids",
+                    "model_kwargs",
+                ]
+            )
+            if pre_asr_prompt_ids is not None and is_prompt_error:
+                log(
+                    f"\n[WARN] ASR推論でプロンプト長起因と思われるエラー発生。Layer Aを無効化して再試行します。\n詳細: {e_asr}"
+                )
                 pre_asr_prompt_ids = None  # type: ignore
-                gen_kw = dict(LANG_KW)
-                out = asr(str(seg_path), return_timestamps=True, generate_kwargs=gen_kw)
+                gen_kw_retry = dict(LANG_KW)
+                out = asr(
+                    str(seg_path),
+                    return_timestamps=True,
+                    generate_kwargs=gen_kw_retry,
+                )
             else:
-                raise
+                raise e_asr
         text = (out.get("text") or "").strip()
         if glossary_entries:
             text = apply_glossary_correction(text, glossary_entries, log)
