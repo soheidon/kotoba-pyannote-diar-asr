@@ -21,6 +21,8 @@ __pycache__/
 *.vtt
 *.txt
 *.log
+!LICENSE.txt
+!requirements.txt
 
 # OS / editor
 .DS_Store
