@@ -54,7 +54,9 @@ Create directories:
 
 ```powershell
 $base = "D:\asr"
-New-Item -ItemType Directory -Force -Path "$base\work\source\output" | Out-Null
+New-Item -ItemType Directory -Force -Path "$base\work\source" | Out-Null
+New-Item -ItemType Directory -Force -Path "$base\work\output" | Out-Null
+New-Item -ItemType Directory -Force -Path "$base\work\dict" | Out-Null
 New-Item -ItemType Directory -Force -Path "$base\hf_cache" | Out-Null
 New-Item -ItemType Directory -Force -Path "$base\tmp" | Out-Null
 ```
@@ -100,32 +102,52 @@ docker run --rm --gpus all `
   -e INPUT_FILENAME="meeting_sample.m4a" `
   -e NUM_SPEAKERS="2" `
   -v D:\asr\work\source:/work/source `
+  -v D:\asr\work\dict:/work/dict `
+  -v D:\asr\work\output:/work/output `
   -v D:\asr\hf_cache:/work/hf_cache `
   -v D:\asr\tmp:/work/tmp `
+  -e DICT_PATH="/work/dict/glossary_confirmed.tsv" `
+  -e WORK_OUTPUT="/work/output" `
   kotoba-diar-asr:cu126
 ```
 
+Omit `-e DICT_PATH=...` and the `-v D:\asr\work\dict:/work/dict` mount for dictionary-off mode.  
+Omit `-e WORK_OUTPUT=...` and `-v D:\asr\work\output:/work/output` to use `WORK_SOURCE/output` (e.g. `D:\asr\work\source\output`).
+
 Outputs will be written to:
 
-* `D:\asr\work\source\output\meeting_sample.txt`
-* `D:\asr\work\source\output\meeting_sample.srt`
+* `D:\asr\work\output\meeting_sample.txt`
+* `D:\asr\work\output\meeting_sample.vtt`
 
 ---
 
 ## Configuration (environment variables)
 
 * `HF_TOKEN`: Hugging Face token (often required)
-* `INPUT_FILENAME`: input audio file name under `/work/source`
+* `WORK_SOURCE`: input directory (default: `/work/source`)
+* `WORK_OUTPUT`: output directory (default: `WORK_SOURCE/output`). Set to `/work/output` for a sibling output dir.
+* `INPUT_FILENAME`: input audio file name under `WORK_SOURCE`
 * `NUM_SPEAKERS`: e.g. `2` (empty or `auto` for auto mode)
+* `DICT_PATH`: path to glossary TSV (formal<TAB>reading). Omit for dictionary-off mode.
+* `GLOSSARY_PROMPT_MAX_ITEMS`: max entries for initial_prompt hint (default: 40)
 * `MODEL_DIAR`: diarization model (default: `pyannote/speaker-diarization-3.1`)
 * `MODEL_ASR`: ASR model (default: `kotoba-tech/kotoba-whisper-v2.2`)
 * `TORCH_LOAD_WEIGHTS_ONLY`: set to `1` to disable the torch.load patch (debug use)
 
 ---
 
+## Dictionary mode (optional)
+
+Set `DICT_PATH` to a TSV file with `formal<TAB>reading` per line (e.g. `宇多津\tうたづ`).
+When set, the pipeline:
+1. Uses the glossary as an `initial_prompt` hint for Whisper (first N entries)
+2. Applies post-inference correction (reading → formal) on ASR output
+
+GPU memory is released after diarization, before ASR loading, to reduce peak VRAM usage.
+
 ## Notes
 
-* VRAM usage can be high because diarization and ASR models are loaded in a single run.
+* VRAM usage is reduced by releasing diarization resources before loading Whisper.
 * This repo includes a compatibility patch that forces `torch.load(..., weights_only=False)` to avoid certain loading issues depending on your environment.
 * Do not store private audio/transcripts in this repository.
 
@@ -188,7 +210,9 @@ docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu22.04 nvidia-smi
 
 ```powershell
 $base = "D:\asr"
-New-Item -ItemType Directory -Force -Path "$base\work\source\output" | Out-Null
+New-Item -ItemType Directory -Force -Path "$base\work\source" | Out-Null
+New-Item -ItemType Directory -Force -Path "$base\work\output" | Out-Null
+New-Item -ItemType Directory -Force -Path "$base\work\dict" | Out-Null
 New-Item -ItemType Directory -Force -Path "$base\hf_cache" | Out-Null
 New-Item -ItemType Directory -Force -Path "$base\tmp" | Out-Null
 ```
@@ -234,32 +258,51 @@ docker run --rm --gpus all `
   -e INPUT_FILENAME="meeting_sample.m4a" `
   -e NUM_SPEAKERS="2" `
   -v D:\asr\work\source:/work/source `
+  -v D:\asr\work\dict:/work/dict `
+  -v D:\asr\work\output:/work/output `
   -v D:\asr\hf_cache:/work/hf_cache `
   -v D:\asr\tmp:/work/tmp `
+  -e DICT_PATH="/work/dict/glossary_confirmed.tsv" `
+  -e WORK_OUTPUT="/work/output" `
   kotoba-diar-asr:cu126
 ```
 
+辞書を使わない場合は `-e DICT_PATH=...` と `-v D:\asr\work\dict:/work/dict` を省く。  
+`WORK_SOURCE/output` に出力したい場合は `-e WORK_OUTPUT=...` と `-v D:\asr\work\output:/work/output` を省く。
+
 出力先：
 
-* `D:\asr\work\source\output\meeting_sample.txt`
-* `D:\asr\work\source\output\meeting_sample.srt`
+* `D:\asr\work\output\meeting_sample.txt`
+* `D:\asr\work\output\meeting_sample.vtt`
 
 ---
 
 ## 設定（環境変数）
 
 * `HF_TOKEN`：Hugging Face トークン（必須になりやすい）
-* `INPUT_FILENAME`：入力音声ファイル名（`/work/source` からの相対）
+* `WORK_SOURCE`：入力ディレクトリ（既定：`/work/source`）
+* `WORK_OUTPUT`：出力ディレクトリ（既定：`WORK_SOURCE/output`）。`/work/output` で兄弟フォルダに出力可
+* `INPUT_FILENAME`：入力音声ファイル名（`WORK_SOURCE` からの相対）
 * `NUM_SPEAKERS`：話者数（例：`2`。空や `auto` で推定寄り）
+* `DICT_PATH`：辞書 TSV のパス（正式表記<TAB>よみ）。未指定で辞書なしモード
+* `GLOSSARY_PROMPT_MAX_ITEMS`：推論前ヒントに使う辞書の最大件数（既定：40）
 * `MODEL_DIAR`：話者分離モデル（既定：`pyannote/speaker-diarization-3.1`）
 * `MODEL_ASR`：ASRモデル（既定：`kotoba-tech/kotoba-whisper-v2.2`）
 * `TORCH_LOAD_WEIGHTS_ONLY`：`1` で torch.load パッチを抑止（切り分け用）
 
 ---
 
+## 辞書ありモード（任意）
+
+`DICT_PATH` に TSV ファイル（正式表記<TAB>よみ、例：`宇多津\tうたづ`）のパスを指定すると：
+1. 辞書を Whisper の `initial_prompt` ヒントとして使用（先頭 N 件）
+2. ASR 出力に対して推論後補正（読み→正式表記）を適用
+
+話者分離終了後、ASR 開始前に GPU メモリを解放し、ピーク VRAM 使用量を抑えている。
+
 ## 補足
 
-* 話者分離とASRを同一実行で回すため、VRAM消費は大きくなりやすい。
+* 話者分離終了後に GPU メモリ解放を行うため、ピーク VRAM は従来より抑えられている。
 * 環境によってモデルロードが失敗するケースがあるため、互換性目的で `torch.load(..., weights_only=False)` を強制するパッチを入れている。
 * 音声や議事録は個人情報・機密情報が混ざりやすいので、リポジトリ外で管理するのが安全である。
 
