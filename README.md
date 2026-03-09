@@ -129,7 +129,7 @@ Outputs will be written to:
 * `INPUT_FILENAME`: input audio file name under `WORK_SOURCE`
 * `NUM_SPEAKERS`: e.g. `2` (empty or `auto` for auto mode)
 * `DICT_PATH`: path to glossary TSV (formal<TAB>reading). Omit for dictionary-off mode.
-* `GLOSSARY_PROMPT_MAX_ITEMS`: max entries for initial_prompt hint (default: 40)
+* `GLOSSARY_TOKEN_BUDGET`: token budget for pre-ASR hint (default: 100). Keeps prompt within Whisper's limit.
 * `MODEL_DIAR`: diarization model (default: `pyannote/speaker-diarization-3.1`)
 * `MODEL_ASR`: ASR model (default: `kotoba-tech/kotoba-whisper-v2.2`)
 * `TORCH_LOAD_WEIGHTS_ONLY`: set to `1` to disable the torch.load patch (debug use)
@@ -140,7 +140,7 @@ Outputs will be written to:
 
 Set `DICT_PATH` to a TSV file with `formal<TAB>reading` per line (e.g. `宇多津\tうたづ`).
 When set, the pipeline:
-1. Uses the glossary as an `initial_prompt` hint for Whisper (first N entries)
+1. Uses the glossary as a `prompt_ids` hint for Whisper (greedy selection within token budget)
 2. Applies post-inference correction (reading → formal) on ASR output
 
 GPU memory is released after diarization, before ASR loading, to reduce peak VRAM usage.
@@ -285,7 +285,7 @@ docker run --rm --gpus all `
 * `INPUT_FILENAME`：入力音声ファイル名（`WORK_SOURCE` からの相対）
 * `NUM_SPEAKERS`：話者数（例：`2`。空や `auto` で推定寄り）
 * `DICT_PATH`：辞書 TSV のパス（正式表記<TAB>よみ）。未指定で辞書なしモード
-* `GLOSSARY_PROMPT_MAX_ITEMS`：推論前ヒントに使う辞書の最大件数（既定：40）
+* `GLOSSARY_TOKEN_BUDGET`：推論前ヒントのトークンバジェット（既定：100）
 * `MODEL_DIAR`：話者分離モデル（既定：`pyannote/speaker-diarization-3.1`）
 * `MODEL_ASR`：ASRモデル（既定：`kotoba-tech/kotoba-whisper-v2.2`）
 * `TORCH_LOAD_WEIGHTS_ONLY`：`1` で torch.load パッチを抑止（切り分け用）

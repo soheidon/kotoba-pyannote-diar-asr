@@ -6,9 +6,9 @@
 #  - エラー時の Traceback 取得と VRAM 使用量のロギングを追加
 #  - 出力を VTT および TXT 形式に変更
 #  - 話者分離終了後の GPU メモリ解放
-#  - 辞書ありモード（TSV形式・2層構造）
-#    Layer A: pre_asr_hint = prompt_ids を generate_kwargs に渡す（失敗時は自動 fallback）
-#    Layer B: post_asr_correction = ASR 後に読み→正式表記を置換補正（常に有効）
+#  - 辞書ありモード（TSV形式・2層構造 + トークンバジェット）
+#    Layer A: pre_asr_hint = prompt_ids（token budget で greedy トリミング、失敗時は自動 fallback）
+#    Layer B: post_asr_correction = ASR 後に読み→正式表記を置換補正（常に有効・全件使用）
 # ================================
 
 import gc
@@ -70,11 +70,11 @@ def _log_gpu_memory(device: int, log_fn) -> None:
             pass
 
 
-def _release_diarization_resources(dia, device: int, log_fn) -> None:
-    """話者分離パイプラインを解放し、GPU メモリをクリアする。
-    dia が None でも gc/empty_cache は実行する。
+def _release_gpu_memory(device: int, log_fn) -> None:
+    """GPU メモリをクリアする。
+    呼び出し側で dia = None 等で参照を絶ってから呼ぶこと。
     """
-    log_fn("[STEP] 話者分離用リソースを解放...")
+    log_fn("[STEP] GPUメモリを解放...")
     _log_gpu_memory(device, log_fn)
     gc.collect()
     if device == 0:
@@ -117,57 +117,89 @@ def load_glossary_tsv(path: Path, log_fn) -> list[tuple[str, str]] | None:
         return None
 
 
-def build_prompt_from_glossary(entries: list[tuple[str, str]], max_items: int, log_fn) -> str:
-    """辞書から Whisper 用プロンプト文を生成する。【Layer A: pre_asr_hint】で使用。
-    将来、優先語だけ抽出しやすいように関数化しておく。
-    """
-    items = entries[:max_items]
-    if not items:
-        return ""
-    pairs = [f"{reading}（{formal}）" for formal, reading in items]
-    text = "この音声では、" + "、".join(pairs) + "などの固有名詞が登場する。"
-    log_fn(f"[DICT] prompt 生成: {len(items)} 件使用（辞書総数={len(entries)}）")
-    return text
-
-
-def build_prompt_ids(prompt_text: str, asr_pipeline, log_fn):
+def build_prompt_ids_with_budget(
+    entries: list[tuple[str, str]],
+    asr_pipeline,
+    token_budget: int,
+    log_fn,
+):
     """
     【Layer A: pre_asr_hint】
-    プロンプト文字列を transformers Whisper が受け付ける prompt_ids テンソルに変換する。
-
-    transformers の WhisperForConditionalGeneration.generate() は、
-    文字列の "initial_prompt" を直接受け付けない（ValueError になる）。
-    正しい渡し方は tokenizer/processor.get_prompt_ids() でトークン化したテンソルを
-    generate_kwargs["prompt_ids"] として渡すこと。
-    参考: https://huggingface.co/docs/transformers/model_doc/whisper#generation
-
-    失敗した場合は None を返し、呼び出し元が post_asr_correction のみで動くよう fallback する。
-    WhisperTokenizerFast では get_prompt_ids が未対応の可能性あり。
+    辞書エントリから token budget に収まる範囲で prompt_ids を生成する。
+    processor か tokenizer のどちらか利用可能な方を使ってトークン化する。
+    正式表記をスペース区切りで greedy に追加し、budget 超過した時点で打ち切る。
+    Whisper の max_target_positions (448) 超過を事前に防ぐ。
     """
     try:
-        tokenizer = getattr(asr_pipeline, "tokenizer", None) or getattr(
-            asr_pipeline, "processor", asr_pipeline
-        )
-        if not hasattr(tokenizer, "get_prompt_ids"):
-            log_fn("[DICT][Layer A] tokenizer に get_prompt_ids がありません（fallback）")
+        if hasattr(asr_pipeline, "processor") and hasattr(
+            asr_pipeline.processor, "get_prompt_ids"
+        ):
+            prompt_helper = asr_pipeline.processor
+        elif hasattr(asr_pipeline, "tokenizer") and hasattr(
+            asr_pipeline.tokenizer, "get_prompt_ids"
+        ):
+            prompt_helper = asr_pipeline.tokenizer
+        else:
+            log_fn("[DICT][Layer A] processor/tokenizer に get_prompt_ids が見つかりません。")
             return None
-        try:
-            prompt_ids = tokenizer.get_prompt_ids(prompt_text, return_tensors="pt")
-        except TypeError:
-            ids = tokenizer.get_prompt_ids(prompt_text)
-            if isinstance(ids, (list, tuple)):
-                prompt_ids = torch.tensor([ids], dtype=torch.long)
-            else:
-                prompt_ids = ids if hasattr(ids, "unsqueeze") else torch.tensor([ids])
+
         target_device = asr_pipeline.model.device
-        prompt_ids = prompt_ids.to(target_device)
+        selected_formals: list[str] = []
+
+        for formal, _ in entries:
+            candidate_text = " ".join(selected_formals + [formal])
+            try:
+                candidate_ids = prompt_helper.get_prompt_ids(
+                    candidate_text, return_tensors="pt"
+                )
+            except TypeError:
+                ids = prompt_helper.get_prompt_ids(candidate_text)
+                if isinstance(ids, (list, tuple)):
+                    candidate_ids = torch.tensor([ids], dtype=torch.long)
+                else:
+                    candidate_ids = (
+                        ids
+                        if hasattr(ids, "unsqueeze")
+                        else torch.tensor([ids], dtype=torch.long)
+                    )
+            if candidate_ids.shape[-1] > token_budget:
+                break
+            selected_formals.append(formal)
+
+        if not selected_formals:
+            log_fn(
+                f"[DICT][Layer A] 1件目からバジェット({token_budget}token)超過。"
+                "pre_asr_hint を無効化します。"
+            )
+            return None
+
+        prompt_text = " ".join(selected_formals)
+        try:
+            prompt_ids = prompt_helper.get_prompt_ids(
+                prompt_text, return_tensors="pt"
+            ).to(target_device)
+        except TypeError:
+            ids = prompt_helper.get_prompt_ids(prompt_text)
+            if isinstance(ids, (list, tuple)):
+                prompt_ids = torch.tensor([ids], dtype=torch.long).to(target_device)
+            else:
+                prompt_ids = (
+                    ids.to(target_device)
+                    if hasattr(ids, "to")
+                    else torch.tensor([ids], dtype=torch.long).to(target_device)
+                )
         log_fn(
-            f"[DICT][Layer A] prompt_ids 生成成功: shape={list(prompt_ids.shape)}, device={target_device}"
+            f"[DICT][Layer A] prompt_ids 生成成功: "
+            f"{len(selected_formals)}件/{len(entries)}件を採用, "
+            f"shape={list(prompt_ids.shape)}, device={target_device}"
         )
+        preview = prompt_text[:120] + ("..." if len(prompt_text) > 120 else "")
+        log_fn(f"[DICT][Layer A] prompt 内容: {preview}")
         return prompt_ids
+
     except Exception:
         log_fn(
-            f"[DICT][Layer A] prompt_ids 生成失敗（model/pipeline 構成では未対応の可能性）:\n{traceback.format_exc()}"
+            f"[DICT][Layer A] prompt_ids 生成失敗:\n{traceback.format_exc()}"
         )
         log_fn("[DICT][Layer A] pre_asr_hint を無効化し、post_asr_correction のみで継続します")
         return None
@@ -262,8 +294,8 @@ LANG_KW = {"language": LANG, "task": TASK}
 # 辞書: 未指定なら辞書なしモード
 DICT_PATH_ENV = os.getenv("DICT_PATH", "").strip()
 DICT_PATH = Path(DICT_PATH_ENV) if DICT_PATH_ENV else None
-# 推論前ヒントに使う辞書の最大件数（長大 prompt を避ける）
-GLOSSARY_PROMPT_MAX_ITEMS = int(os.getenv("GLOSSARY_PROMPT_MAX_ITEMS", "40"))
+# Layer A: 推論前ヒントのトークンバジェット（Whisper max_target_positions=448 を考慮して余裕を持たせる）
+GLOSSARY_TOKEN_BUDGET = int(os.getenv("GLOSSARY_TOKEN_BUDGET", "100"))
 
 device = 0 if torch.cuda.is_available() else -1
 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
@@ -274,6 +306,7 @@ log(f"[CFG] WORK_OUTPUT={WORK_OUTPUT}")
 log(f"[CFG] INPUT_FILENAME='{INPUT_FILENAME}'")
 log(f"[CFG] NUM_SPEAKERS_ENV='{NUM_SPEAKERS_ENV}' -> NUM_SPEAKERS={NUM_SPEAKERS}")
 log(f"[CFG] DICT_PATH={DICT_PATH if DICT_PATH else '(未指定・辞書なし)'}")
+log(f"[CFG] GLOSSARY_TOKEN_BUDGET={GLOSSARY_TOKEN_BUDGET}")
 
 if not INPUT_FILE.exists():
     raise FileNotFoundError(f"入力が見つかりません: {INPUT_FILE}")
@@ -354,7 +387,7 @@ except Exception as e:
     try:
         if dia is not None:
             dia = None
-        _release_diarization_resources(dia, device, log)
+        _release_gpu_memory(device, log)
     except Exception:
         pass
     raise
@@ -362,7 +395,7 @@ except Exception as e:
 # 話者分離終了後、ASR 開始前に GPU メモリを解放
 if dia is not None:
     dia = None
-_release_diarization_resources(dia, device, log)
+_release_gpu_memory(device, log)
 
 # ================================
 # 辞書読み込み（辞書ありモード）
@@ -371,14 +404,8 @@ glossary_entries: list[tuple[str, str]] | None = None
 if DICT_PATH:
     glossary_entries = load_glossary_tsv(DICT_PATH, log)
 
-pre_asr_hint_text: str | None = None
 if glossary_entries:
-    prompt_text = build_prompt_from_glossary(
-        glossary_entries, GLOSSARY_PROMPT_MAX_ITEMS, log
-    )
-    if prompt_text:
-        pre_asr_hint_text = prompt_text
-    log("[DICT][Layer B] post_asr_correction を有効化しました")
+    log(f"[DICT][Layer B] post_asr_correction を有効化しました（全{len(glossary_entries)}件使用）")
 else:
     log("[DICT] 辞書なしモードで実行します")
 
@@ -404,12 +431,14 @@ except Exception as e:
 # pipeline ロード後に prompt_ids を生成（tokenizer が使える状態になってから）
 # ================================
 pre_asr_prompt_ids = None
-if pre_asr_hint_text:
-    pre_asr_prompt_ids = build_prompt_ids(pre_asr_hint_text, asr, log)
+if glossary_entries:
+    pre_asr_prompt_ids = build_prompt_ids_with_budget(
+        glossary_entries, asr, GLOSSARY_TOKEN_BUDGET, log
+    )
     if pre_asr_prompt_ids is not None:
         log("[DICT][Layer A] pre_asr_hint 有効: prompt_ids を generate_kwargs に渡します")
     else:
-        log("[DICT][Layer A] pre_asr_hint 無効（上記 fallback ログ参照）: post_asr_correction のみ使用します")
+        log("[DICT][Layer A] pre_asr_hint 無効: post_asr_correction のみで継続します")
 
 log("[STEP] セグメントごとにASR中...")
 
