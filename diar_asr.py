@@ -6,7 +6,9 @@
 #  - エラー時の Traceback 取得と VRAM 使用量のロギングを追加
 #  - 出力を VTT および TXT 形式に変更
 #  - 話者分離終了後の GPU メモリ解放
-#  - 辞書ありモード（TSV形式・推論前ヒント＋推論後補正）
+#  - 辞書ありモード（TSV形式・2層構造）
+#    Layer A: pre_asr_hint = prompt_ids を generate_kwargs に渡す（失敗時は自動 fallback）
+#    Layer B: post_asr_correction = ASR 後に読み→正式表記を置換補正（常に有効）
 # ================================
 
 import gc
@@ -116,7 +118,7 @@ def load_glossary_tsv(path: Path, log_fn) -> list[tuple[str, str]] | None:
 
 
 def build_prompt_from_glossary(entries: list[tuple[str, str]], max_items: int, log_fn) -> str:
-    """辞書から Whisper 用 initial_prompt 文を生成する。
+    """辞書から Whisper 用プロンプト文を生成する。【Layer A: pre_asr_hint】で使用。
     将来、優先語だけ抽出しやすいように関数化しておく。
     """
     items = entries[:max_items]
@@ -128,9 +130,54 @@ def build_prompt_from_glossary(entries: list[tuple[str, str]], max_items: int, l
     return text
 
 
+def build_prompt_ids(prompt_text: str, asr_pipeline, log_fn):
+    """
+    【Layer A: pre_asr_hint】
+    プロンプト文字列を transformers Whisper が受け付ける prompt_ids テンソルに変換する。
+
+    transformers の WhisperForConditionalGeneration.generate() は、
+    文字列の "initial_prompt" を直接受け付けない（ValueError になる）。
+    正しい渡し方は tokenizer/processor.get_prompt_ids() でトークン化したテンソルを
+    generate_kwargs["prompt_ids"] として渡すこと。
+    参考: https://huggingface.co/docs/transformers/model_doc/whisper#generation
+
+    失敗した場合は None を返し、呼び出し元が post_asr_correction のみで動くよう fallback する。
+    WhisperTokenizerFast では get_prompt_ids が未対応の可能性あり。
+    """
+    try:
+        tokenizer = getattr(asr_pipeline, "tokenizer", None) or getattr(
+            asr_pipeline, "processor", asr_pipeline
+        )
+        if not hasattr(tokenizer, "get_prompt_ids"):
+            log_fn("[DICT][Layer A] tokenizer に get_prompt_ids がありません（fallback）")
+            return None
+        try:
+            prompt_ids = tokenizer.get_prompt_ids(prompt_text, return_tensors="pt")
+        except TypeError:
+            ids = tokenizer.get_prompt_ids(prompt_text)
+            if isinstance(ids, (list, tuple)):
+                prompt_ids = torch.tensor([ids], dtype=torch.long)
+            else:
+                prompt_ids = ids if hasattr(ids, "unsqueeze") else torch.tensor([ids])
+        target_device = asr_pipeline.model.device
+        prompt_ids = prompt_ids.to(target_device)
+        log_fn(
+            f"[DICT][Layer A] prompt_ids 生成成功: shape={list(prompt_ids.shape)}, device={target_device}"
+        )
+        return prompt_ids
+    except Exception:
+        log_fn(
+            f"[DICT][Layer A] prompt_ids 生成失敗（model/pipeline 構成では未対応の可能性）:\n{traceback.format_exc()}"
+        )
+        log_fn("[DICT][Layer A] pre_asr_hint を無効化し、post_asr_correction のみで継続します")
+        return None
+
+
 def apply_glossary_correction(text: str, entries: list[tuple[str, str]], log_fn) -> str:
-    """ASR 出力に対して読み→正式表記の補正を行う。
+    """【Layer B: post_asr_correction】
+    ASR 出力に対して読み→正式表記の補正を行う。
     長い読みを先に置換して、短い読みが長い読みに含まれる場合の誤置換を防ぐ。
+    辞書あり時は常に有効。
     """
     if not text or not entries:
         return text
@@ -143,7 +190,7 @@ def apply_glossary_correction(text: str, entries: list[tuple[str, str]], log_fn)
             result = result.replace(reading, formal)
             replaced += 1
     if replaced > 0:
-        log_fn(f"[DICT] 補正実行: {replaced} 箇所置換")
+        log_fn(f"[DICT][Layer B] 補正実行: {replaced} 箇所置換")
     return result
 
 
@@ -321,15 +368,14 @@ glossary_entries: list[tuple[str, str]] | None = None
 if DICT_PATH:
     glossary_entries = load_glossary_tsv(DICT_PATH, log)
 
-asr_kw = dict(LANG_KW)
-initial_prompt_value: str | None = None
+pre_asr_hint_text: str | None = None
 if glossary_entries:
     prompt_text = build_prompt_from_glossary(
         glossary_entries, GLOSSARY_PROMPT_MAX_ITEMS, log
     )
     if prompt_text:
-        initial_prompt_value = prompt_text
-        log("[DICT] 推論前ヒントを initial_prompt に設定しました")
+        pre_asr_hint_text = prompt_text
+    log("[DICT][Layer B] post_asr_correction を有効化しました")
 else:
     log("[DICT] 辞書なしモードで実行します")
 
@@ -350,6 +396,18 @@ except Exception as e:
     log(f"[FATAL ERROR] Whisperモデルロード中に例外発生:\n{traceback.format_exc()}")
     raise
 
+# ================================
+# 辞書 Layer A: pre_asr_hint
+# pipeline ロード後に prompt_ids を生成（tokenizer が使える状態になってから）
+# ================================
+pre_asr_prompt_ids = None
+if pre_asr_hint_text:
+    pre_asr_prompt_ids = build_prompt_ids(pre_asr_hint_text, asr, log)
+    if pre_asr_prompt_ids is not None:
+        log("[DICT][Layer A] pre_asr_hint 有効: prompt_ids を generate_kwargs に渡します")
+    else:
+        log("[DICT][Layer A] pre_asr_hint 無効（上記 fallback ログ参照）: post_asr_correction のみ使用します")
+
 log("[STEP] セグメントごとにASR中...")
 
 tmp_seg_dir = tempfile.mkdtemp(prefix="seg_", dir=str(WORK_TMP))
@@ -365,10 +423,21 @@ try:
         seg_path = Path(tmp_seg_dir) / f"seg_{idx:04d}.wav"
         seg.export(str(seg_path), format="wav")
 
-        call_kw = {"return_timestamps": True, "generate_kwargs": asr_kw}
-        if initial_prompt_value:
-            call_kw["initial_prompt"] = initial_prompt_value
-        out = asr(str(seg_path), **call_kw)
+        # prompt_ids は transformers Whisper の正式パラメータ。
+        # initial_prompt（文字列）は model_kwargs で弾かれるため使用しない。
+        gen_kw = dict(LANG_KW)
+        if pre_asr_prompt_ids is not None:
+            gen_kw["prompt_ids"] = pre_asr_prompt_ids
+        try:
+            out = asr(str(seg_path), return_timestamps=True, generate_kwargs=gen_kw)
+        except ValueError as e:
+            if "not used by the model" in str(e) and pre_asr_prompt_ids is not None:
+                log("[DICT][Layer A] prompt_ids/initial_prompt がモデルに未対応のため無効化し、再試行します")
+                pre_asr_prompt_ids = None  # type: ignore
+                gen_kw = dict(LANG_KW)
+                out = asr(str(seg_path), return_timestamps=True, generate_kwargs=gen_kw)
+            else:
+                raise
         text = (out.get("text") or "").strip()
         if glossary_entries:
             text = apply_glossary_correction(text, glossary_entries, log)
